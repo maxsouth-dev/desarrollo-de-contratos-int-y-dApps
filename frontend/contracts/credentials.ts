@@ -1,5 +1,4 @@
-// Replace with the address you deployed on Base Sepolia.
-export const CREDENTIALS_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
+export const CREDENTIALS_ADDRESS = '0xb170Ad0A7048b885f0f05641BfE4ca5eFebf6A13' as const;
 
 export const ISSUER_ROLE =
   '0x114e74f6ea3bd819998f78687bfcb11b140da08e9b7d222fa9c1f1ba1f2aa122' as const; // keccak256("ISSUER_ROLE")

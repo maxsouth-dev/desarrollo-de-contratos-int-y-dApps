@@ -6,8 +6,9 @@ import {AcademicCredentials} from "../src/AcademicCredentials.sol";
 
 /// @title DeployAcademicCredentials
 /// @notice Deploys the AcademicCredentials registry. The deployer becomes the issuer.
-/// @dev    Run with:
-///         forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --account dev-wallet
+/// @dev    Run with (requires .env, see .env.example):
+///         source .env
+///         forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL --private-key $PRIVATE_KEY --broadcast
 contract DeployAcademicCredentials is Script {
     function run() external returns (AcademicCredentials) {
         vm.startBroadcast();
