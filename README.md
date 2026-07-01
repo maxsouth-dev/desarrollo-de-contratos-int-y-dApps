@@ -1,42 +1,139 @@
-# Clase 3 — Credenciales Académicas (ERC-721 con OpenZeppelin)
+# AcademicCredentials, Sistema de Certificación de Títulos UNQ
 
-Diplomatura Blockchain UNQ — Módulo 3.
+**Diplomatura Blockchain UNQ, Módulo 3**
+**Integrante:** Maximiliano Cacace
+**Docentes:** Dr. David Petrocelli, Esp. Ciro Edgardo Romero
+**Año:** 2026
 
-## ¿Qué es esto?
+---
 
-Un contrato ERC-721 (NFT) llamado `AcademicCredentials` que permite a la universidad **emitir títulos verificables on-chain**. Cada título es un NFT único, asociado a la wallet del estudiante, con metadata (nombre del título, fecha, hash del PDF) en IPFS.
+## Parte 0, Hook UNQ
 
-Este contrato es la **base del TP final** de la materia: vamos a usarlo como punto de partida y le agregaremos roles (`AccessControl`), no-transferibilidad (soulbound) y verificación pública desde un frontend.
+### ¿Qué problema resuelve?
 
-## Pre-requisitos
+Argentina tiene un problema documentado de diplomas falsos. La "Operación Alejo" expuso más de 500 títulos fraudulentos en circulación. En 2021, un médico ejerció en Río Cuarto con un título falsificado que nunca fue detectado por los sistemas actuales. La UNQ emite sus títulos a través de SIDCER, un sistema centralizado donde la verificación depende de un funcionario que responda un mail o atienda el teléfono, proceso que puede tardar semanas.
 
-- Foundry (`forge`, `cast`, `anvil`) — si no lo tenés: `curl -L https://foundry.paradigm.xyz | bash && foundryup`
-- Cuenta de MetaMask en **Sepolia** con ETH de testnet
-- VS Code + extensión `juanblanco.solidity`
+### ¿Qué área de la UNQ operaría el sistema?
 
-## Setup
+La Secretaría Académica de la UNQ, con el Rectorado como autoridad máxima (`DEFAULT_ADMIN_ROLE`) y los decanos de cada unidad académica como emisores (`ISSUER_ROLE`). El sistema no reemplaza a SIDCER, sino que agrega una capa de verificación pública e instantánea sobre los títulos ya emitidos.
+
+### ¿Quién se beneficia?
+
+- **Graduados** que tramitan reconocimiento de títulos en el exterior: presentan el `tokenId` y el empleador o institución verifica en segundos sin contactar a la UNQ.
+- **Empleadores** que contratan profesionales: verifican la autenticidad del título en Basescan sin intermediarios.
+- **La UNQ**: reduce la carga operativa de verificaciones manuales y elimina la posibilidad de falsificación del documento on-chain.
+
+### ¿Por qué blockchain y no una base de datos firmada?
+
+Una base de datos firmada sigue siendo centralizada: si la UNQ cae, si el servidor es hackeado, o si un funcionario modifica un registro, no hay forma pública de detectarlo. Con blockchain, cada emisión es un evento inmutable, público y verificable por cualquier persona sin depender de la universidad. La referencia más directa es la Universidad Nacional de Córdoba, ganadora del IMetaRed TIC 2025, que implementó un sistema similar y redujo el tiempo de verificación de títulos de 4 meses a 2 semanas.
+
+---
+
+## Parte 0.2, Arquitectura y Modelado
+
+### Diagrama de componentes
+
+```mermaid
+graph TD
+    Rector["Wallet Rector\n(DEFAULT_ADMIN_ROLE)"]
+    Decano["Wallet Decano\n(ISSUER_ROLE)"]
+    Contrato["AcademicCredentials.sol\n(Base Sepolia)"]
+    IPFS["IPFS / Pinata\n(metadata JSON)"]
+    Frontend["Frontend\n(Next.js + wagmi)"]
+    Basescan["Basescan\n(explorador público)"]
+    Empleador["Empleador / Verificador\n(browser, sin login)"]
+    Graduado["Graduado\n(wallet MetaMask)"]
+
+    Rector -->|"grantIssuer(address)"| Contrato
+    Decano -->|"issueCredential(...)"| Contrato
+    Contrato -->|"metadataURI ipfs://"| IPFS
+    Contrato -->|"evento CredentialIssued"| Basescan
+    Frontend -->|"verify(tokenId)"| Contrato
+    Empleador -->|"ingresa tokenId"| Frontend
+    Graduado -->|"recibe NFT"| Contrato
+```
+
+### Justificación del struct `Credential`
+
+```solidity
+struct Credential {
+    string   degreeName;       // nombre del grado, en texto plano, dato público
+    bytes32  studentNameHash;  // keccak256 del nombre, privacidad por commitment
+    uint256  issueDate;        // block.timestamp, trazabilidad temporal
+    bytes32  documentHash;     // keccak256 del PDF original, integridad del documento
+    bool     active;           // false si fue revocado
+}
+```
+
+**¿Por qué `studentNameHash` y no el nombre en texto?**
+El nombre es un dato personal protegido por GDPR y la Ley 25.326 de Argentina. Almacenarlo en texto plano en blockchain lo haría público e inmutable para siempre. El hash permite verificar que "Juan Pérez" es el titular sin exponer el nombre a terceros que solo tienen el hash.
+
+**¿Por qué `documentHash` separado de `metadataURI`?**
+`metadataURI` apunta a un JSON en IPFS que puede contener foto, firma y más datos. `documentHash` es el `keccak256` del PDF del diploma. Si la universidad pierde el JSON de IPFS (el pin expira, Pinata cierra), el `documentHash` on-chain sigue siendo la prueba de integridad del PDF original, que el graduado puede conservar localmente.
+
+**¿Qué pasa si la universidad pierde el JSON de IPFS?**
+El contrato on-chain conserva `degreeName`, `studentNameHash`, `issueDate` y `documentHash`. La validez del título no depende de IPFS. La metadata adicional (foto, firma) se pierde, pero la prueba de existencia y validez del título permanece.
+
+### Flujo de emisión
+
+```mermaid
+sequenceDiagram
+    participant Rector
+    participant Contrato as AcademicCredentials.sol
+    participant Decano
+    participant Basescan
+    participant Frontend
+
+    Rector->>Contrato: grantIssuer(decano_address)
+    Contrato-->>Basescan: evento IssuerGranted
+    Decano->>Contrato: issueCredential(student, tokenId, degreeName, nameHash, docHash, uri)
+    Contrato-->>Basescan: evento CredentialIssued
+    Basescan-->>Frontend: indexa el evento
+    Frontend-->>Frontend: muestra credencial emitida
+```
+
+### Flujo de verificación pública
+
+```mermaid
+sequenceDiagram
+    participant Empleador
+    participant Frontend
+    participant Contrato as AcademicCredentials.sol
+
+    Empleador->>Frontend: ingresa tokenId en /verify/<tokenId>
+    Frontend->>Contrato: verify(tokenId)
+    Contrato-->>Frontend: (Credential, isValid)
+    Frontend-->>Empleador: muestra degreeName, issueDate, isValid, documentHash
+```
+
+---
+
+## Setup local
 
 ```bash
 git clone https://github.com/dpetrocelli/diplo-unq-blockchain-clase3.git
 cd diplo-unq-blockchain-clase3
-forge install foundry-rs/forge-std --shallow
-forge install OpenZeppelin/openzeppelin-contracts --shallow
+forge install
 forge build
 forge test
+forge coverage
 ```
 
-Tienen que ver `14 passed; 0 failed`.
+Resultado esperado: `34 passed; 0 failed`, cobertura `100%` en `AcademicCredentials.sol`.
 
-## Comandos clave
+---
+
+## Comandos principales
 
 ```bash
 forge build              # compilar
 forge test               # tests
 forge test -vvv          # con detalle
-anvil                    # blockchain local
+forge coverage           # cobertura
+anvil                    # nodo local
 ```
 
-### Deploy local (con anvil corriendo en otra terminal)
+### Deploy local (con anvil corriendo)
 
 ```bash
 forge create src/AcademicCredentials.sol:AcademicCredentials \
@@ -45,82 +142,87 @@ forge create src/AcademicCredentials.sol:AcademicCredentials \
   --broadcast
 ```
 
-### Emitir un título a alice (usando cast)
+### Deploy a Base Sepolia
 
 ```bash
-export ADDR=<dirección del contrato deployado>
-export ALICE=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-
-cast send $ADDR \
-  "issueCredential(address,uint256,string)" \
-  $ALICE 1 "ipfs://bafy.../titulo-licenciatura-sistemas.json" \
-  --rpc-url http://localhost:8545 \
-  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-```
-
-### Verificar el título
-
-```bash
-# ¿Quién es el dueño del tokenId 1?
-cast call $ADDR "ownerOf(uint256)" 1 --rpc-url http://localhost:8545
-
-# ¿Cuál es la metadata?
-cast call $ADDR "tokenURI(uint256)" 1 --rpc-url http://localhost:8545
-
-# ¿Es válido?
-cast call $ADDR "isValid(uint256)" 1 --rpc-url http://localhost:8545
-```
-
-### Deploy a Sepolia
-
-```bash
-cast wallet import dev-wallet --interactive  # solo la primera vez
+cast wallet import dev-wallet --interactive
 
 forge create src/AcademicCredentials.sol:AcademicCredentials \
-  --rpc-url https://ethereum-sepolia-rpc.publicnode.com \
+  --rpc-url https://sepolia.base.org \
   --account dev-wallet \
   --broadcast
 ```
 
-## Estructura
+### Emitir una credencial
+
+```bash
+export ADDR=<dirección del contrato>
+export STUDENT=<wallet del estudiante>
+
+cast send $ADDR \
+  "issueCredential(address,uint256,string,bytes32,bytes32,string)" \
+  $STUDENT 1 "Licenciatura en Sistemas" \
+  $(cast keccak "Juan Perez") \
+  $(cast keccak "pdf-bytes-placeholder") \
+  "ipfs://bafy.../credential-1.json" \
+  --rpc-url https://sepolia.base.org \
+  --account dev-wallet
+```
+
+### Verificar una credencial
+
+```bash
+cast call $ADDR "verify(uint256)" 1 --rpc-url https://sepolia.base.org
+```
+
+---
+
+## Estructura del repositorio
 
 ```
 .
-├── foundry.toml
-├── remappings.txt
 ├── src/
-│   └── AcademicCredentials.sol    # ERC-721 + Ownable + issue + revoke
+│   └── AcademicCredentials.sol    # contrato principal
 ├── test/
-│   └── AcademicCredentials.t.sol  # 14 tests (issue, revoke, metadata, fuzz)
-└── script/
-    └── Deploy.s.sol
+│   └── AcademicCredentials.t.sol  # 34 tests (unit + fuzz), 100% cobertura
+├── script/
+│   └── Deploy.s.sol               # script de deploy
+├── SECURITY.md                    # análisis Slither + análisis propio
+├── foundry.toml
+└── remappings.txt
 ```
+
+---
 
 ## Funciones del contrato
 
-| Función | Quién puede llamarla | Qué hace |
-|---|---|---|
-| `issueCredential(student, tokenId, metadataURI)` | Solo el `owner` (la universidad) | Emite un título nuevo a un estudiante |
-| `revoke(tokenId)` | Solo el `owner` | Revoca (quema) un título emitido |
-| `ownerOf(tokenId)` | Cualquiera | Devuelve la address del dueño del título |
-| `tokenURI(tokenId)` | Cualquiera | Devuelve la URI con la metadata del título |
-| `balanceOf(address)` | Cualquiera | Cantidad de títulos que tiene una wallet |
-| `isValid(tokenId)` | Cualquiera | `true` si el título existe y no fue revocado |
+| Función | Rol requerido | Descripción |
+|---------|--------------|-------------|
+| `grantIssuer(address)` | `DEFAULT_ADMIN_ROLE` | Otorga `ISSUER_ROLE` a un emisor |
+| `revokeIssuer(address)` | `DEFAULT_ADMIN_ROLE` | Revoca `ISSUER_ROLE` de un emisor |
+| `issueCredential(student, tokenId, degreeName, studentNameHash, documentHash, metadataURI)` | `ISSUER_ROLE` | Emite una credencial y almacena todos los campos |
+| `revoke(tokenId, reason)` | `ISSUER_ROLE` | Revoca una credencial con motivo |
+| `verify(tokenId)` | Cualquiera | Retorna `(Credential, isValid)` |
 
-## Tarea para clase 4
+---
 
-1. Deployar `AcademicCredentials` en Sepolia
-2. Emitirle un título a tu propia wallet con un `tokenURI` placeholder
-3. Postear en el foro: la dirección del contrato + el `tokenId` del título emitido
-4. (Opcional) Subir un JSON de metadata real a Pinata/IPFS y poner el CID en el `tokenURI`
+## Contrato en Base Sepolia
 
-## ¿Y para el TP final?
+> Completar tras el deploy:
 
-El TP final es **construir un sistema de certificación de títulos UNQ** sobre este contrato. Vas a agregar:
+- **Dirección del contrato:** `pending`
+- **Basescan:** `pending`
+- **Credencial 1:** `pending`
+- **Credencial 2:** `pending`
+- **Credencial 3:** `pending`
+- **Frontend:** `pending`
+- **Video demo:** `pending`
 
-- `AccessControl` con roles `ISSUER_ROLE` (decanos) y `VERIFIER_ROLE`
-- Soulbound: que los títulos NO sean transferibles (sobrescribir `_update`)
-- Frontend con dos modos: panel admin (emitir) y verificador público (chequear por DNI hash)
-- Metadata real en IPFS con foto + firma digital + hash del PDF
+---
 
-Lo vemos en detalle más adelante.
+## Recursos
+
+- OpenZeppelin Wizard: https://wizard.openzeppelin.com/#custom
+- Consigna del trabajo final: https://dpetrocelli.github.io/diplounq2026/tp-final.html
+- Base Sepolia faucet: https://www.coinbase.com/faucets/base-ethereum-sepolia-faucet
+- Basescan: https://sepolia.basescan.org

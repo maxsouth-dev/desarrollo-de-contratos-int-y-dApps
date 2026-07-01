@@ -1,76 +1,176 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721URIStorage} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
 /// @title AcademicCredentials
-/// @notice ERC-721 to issue and verify academic credentials (titulos) on-chain
-/// @dev Each tokenId represents a single, unique credential. Metadata (degree
-///      name, student name hash, issue date, PDF hash) lives off-chain in IPFS
-///      and is referenced by the tokenURI.
-contract AcademicCredentials is ERC721URIStorage, Ownable {
+/// @notice ERC-721 soulbound credential registry for UNQ academic titles.
+/// @dev Tokens are non-transferable (soulbound). Role-based access:
+///      DEFAULT_ADMIN_ROLE (rector) manages issuers.
+///      ISSUER_ROLE (deans/secretaries) issues and revokes credentials.
+contract AcademicCredentials is ERC721URIStorage, AccessControl {
+
+    bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
+
+    // ==========================================================================
+    // STRUCTS
+    // ==========================================================================
+
+    struct Credential {
+        string   degreeName;
+        bytes32  studentNameHash;  // keccak256 of student name (privacy)
+        uint256  issueDate;        // block.timestamp at issuance
+        bytes32  documentHash;     // keccak256 of original PDF
+        bool     active;           // false if revoked
+    }
+
+    mapping(uint256 => Credential) public credentials;
+
     // ==========================================================================
     // EVENTS
     // ==========================================================================
 
-    /// @notice Emitted when the issuer mints a new credential
-    /// @param student     wallet address of the student that receives the title
-    /// @param tokenId     unique credential id (assigned by the issuer)
-    /// @param metadataURI ipfs URI of the credential JSON metadata
-    event CredentialIssued(address indexed student, uint256 indexed tokenId, string metadataURI);
+    event CredentialIssued(
+        address indexed student,
+        uint256 indexed tokenId,
+        string  degreeName,
+        bytes32 studentNameHash
+    );
 
-    /// @notice Emitted when the issuer revokes (burns) a credential
-    /// @param tokenId   credential id that was revoked
-    event CredentialRevoked(uint256 indexed tokenId);
+    event CredentialRevoked(
+        uint256 indexed tokenId,
+        address indexed by,
+        string  reason
+    );
+
+    event IssuerGranted(
+        address indexed account,
+        address indexed by
+    );
+
+    event IssuerRevoked(
+        address indexed account,
+        address indexed by
+    );
 
     // ==========================================================================
     // CONSTRUCTOR
     // ==========================================================================
 
-    /// @notice Deploys the credential registry. The deployer becomes the issuer.
-    /// @dev    The owner is the only address allowed to issue or revoke credentials.
-    constructor()
-        ERC721("UNQ Academic Credential", "UNQ-CRED")
-        Ownable(msg.sender)
-    {}
+    /// @notice Deployer gets DEFAULT_ADMIN_ROLE and ISSUER_ROLE.
+    constructor() ERC721("UNQ Academic Credential", "UNQ-CRED") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ISSUER_ROLE, msg.sender);
+    }
 
     // ==========================================================================
-    // EXTERNAL — ISSUER
+    // ADMIN — role management
     // ==========================================================================
 
-    /// @notice Issues a new credential to a student
-    /// @param student     wallet that will own the credential
-    /// @param tokenId     unique id assigned to this credential
-    /// @param metadataURI ipfs:// or https:// URI pointing to the credential JSON
-    function issueCredential(address student, uint256 tokenId, string memory metadataURI)
-        public
-        onlyOwner
-    {
-        // We use _mint (not _safeMint) because credentials are always issued to
-        // student wallets (EOAs or smart-contract wallets that already accept transfers).
-        // _mint already reverts if `student` is the zero address.
+    /// @notice Grants ISSUER_ROLE to an account.
+    /// @param account address to grant the role to
+    function grantIssuer(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(ISSUER_ROLE, account);
+        emit IssuerGranted(account, msg.sender);
+    }
+
+    /// @notice Revokes ISSUER_ROLE from an account.
+    /// @param account address to revoke the role from
+    function revokeIssuer(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _revokeRole(ISSUER_ROLE, account);
+        emit IssuerRevoked(account, msg.sender);
+    }
+
+    // ==========================================================================
+    // ISSUER — credential lifecycle
+    // ==========================================================================
+
+    /// @notice Issues a new credential to a student wallet.
+    /// @param student          recipient wallet
+    /// @param tokenId          unique id for this credential
+    /// @param degreeName       name of the degree (e.g. "Licenciatura en Sistemas")
+    /// @param studentNameHash  keccak256 of the student's full name
+    /// @param documentHash     keccak256 of the original PDF diploma
+    /// @param metadataURI      ipfs:// URI pointing to the credential JSON
+    function issueCredential(
+        address student,
+        uint256 tokenId,
+        string  memory degreeName,
+        bytes32 studentNameHash,
+        bytes32 documentHash,
+        string  memory metadataURI
+    ) external onlyRole(ISSUER_ROLE) {
+        require(student != address(0),        "AcademicCredentials: zero address");
+        require(bytes(degreeName).length > 0, "AcademicCredentials: empty degreeName");
+        require(studentNameHash != bytes32(0),"AcademicCredentials: empty studentNameHash");
+        require(documentHash    != bytes32(0),"AcademicCredentials: empty documentHash");
+
         _mint(student, tokenId);
         _setTokenURI(tokenId, metadataURI);
-        emit CredentialIssued(student, tokenId, metadataURI);
+
+        credentials[tokenId] = Credential({
+            degreeName:      degreeName,
+            studentNameHash: studentNameHash,
+            issueDate:       block.timestamp,
+            documentHash:    documentHash,
+            active:          true
+        });
+
+        emit CredentialIssued(student, tokenId, degreeName, studentNameHash);
     }
 
-    /// @notice Revokes (burns) a previously issued credential
-    /// @param tokenId credential id to revoke
-    function revoke(uint256 tokenId) public onlyOwner {
+    /// @notice Revokes a previously issued credential.
+    /// @param tokenId  credential id to revoke
+    /// @param reason   human-readable reason for revocation
+    function revoke(uint256 tokenId, string memory reason) external onlyRole(ISSUER_ROLE) {
+        require(credentials[tokenId].active, "AcademicCredentials: not active");
+        credentials[tokenId].active = false;
         _burn(tokenId);
-        emit CredentialRevoked(tokenId);
+        emit CredentialRevoked(tokenId, msg.sender, reason);
     }
 
     // ==========================================================================
-    // PUBLIC — VERIFIERS (anyone)
+    // PUBLIC — verification (anyone)
     // ==========================================================================
 
-    /// @notice Convenience helper: tells you whether a credential is currently valid
-    /// @param tokenId credential id
-    /// @return true if a credential with this id exists, false otherwise
-    function isValid(uint256 tokenId) public view returns (bool) {
-        return _ownerOf(tokenId) != address(0);
+    /// @notice Returns the stored credential data and its current validity.
+    /// @param tokenId  credential id to verify
+    /// @return cred    the Credential struct
+    /// @return isValid true if credential exists and has not been revoked
+    function verify(uint256 tokenId) external view returns (Credential memory cred, bool isValid) {
+        cred    = credentials[tokenId];
+        isValid = _ownerOf(tokenId) != address(0) && cred.active;
+    }
+
+    // ==========================================================================
+    // SOULBOUND — block all transfers
+    // ==========================================================================
+
+    /// @dev Reverts on any transfer. Mints (from == 0) and burns (to == 0) are allowed.
+    function _update(address to, uint256 tokenId, address auth)
+        internal
+        override
+        returns (address)
+    {
+        address from = _ownerOf(tokenId);
+        if (from != address(0) && to != address(0)) {
+            revert("AcademicCredentials: non-transferable");
+        }
+        return super._update(to, tokenId, auth);
+    }
+
+    // ==========================================================================
+    // INTERFACE SUPPORT
+    // ==========================================================================
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721URIStorage, AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
     }
 }

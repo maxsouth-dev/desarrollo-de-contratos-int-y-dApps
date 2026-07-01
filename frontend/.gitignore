@@ -1,15 +1,21 @@
 # Foundry
-out/
-cache/
-broadcast/
-lcov.info
+**/out/
+**/cache/
+**/broadcast/
 
 # Dependencies
-lib/
+**/lib/
+**/node_modules/
+
+# Next.js
+.next/
+.vercel/
+build/
 
 # Env
 .env
 .env.local
+.env.*.local
 
 # OS
 .DS_Store
